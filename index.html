@@ -7890,34 +7890,71 @@ const HC_PENDING_SK    = 'hc_pending_img_uploads';
 // Quality is high (0.85) because Storage has no meaningful size ceiling — unlike the local
 // 100KB-capped preview, this is the "real" copy the app will actually display from the cloud.
 function hcMakeWebpBlob(file,maxDim,cb){
-  const r=new FileReader();
-  r.onload=function(e){
-    const img=new Image();
-    img.onload=function(){
-      let w=img.width,h=img.height;
-      if(w>maxDim||h>maxDim){
-        if(w>h){h=Math.round(h*maxDim/w);w=maxDim;}
-        else{w=Math.round(w*maxDim/h);h=maxDim;}
-      }
-      const canvas=document.createElement('canvas');
-      canvas.width=w;canvas.height=h;
-      canvas.getContext('2d').drawImage(img,0,0,w,h);
-      if(canvas.toBlob){
-        canvas.toBlob(function(blob){
-          if(blob&&blob.size>0){cb(blob,'image/webp');}
-          else canvas.toBlob(function(b2){cb(b2,'image/jpeg');},'image/jpeg',0.85);
-        },'image/webp',0.85);
-      }else{
-        // Ancient-browser fallback: no toBlob support at all.
-        const du=canvas.toDataURL('image/jpeg',0.85);
-        fetch(du).then(function(rr){return rr.blob();}).then(function(b){cb(b,'image/jpeg');}).catch(function(){cb(null,null);});
-      }
-    };
-    img.onerror=function(){cb(null,null);};
-    img.src=e.target.result;
+  // Last-resort fallback: upload the original file exactly as picked, uncompressed.
+  // Used only if every resize attempt below also fails (very rare).
+  const rawFallback=function(reason){
+    fbLog((reason||'Image compression unavailable')+' — uploading original file instead','info');
+    cb(file,file.type||'image/jpeg');
   };
-  r.onerror=function(){cb(null,null);};
-  r.readAsDataURL(file);
+  let settled=false;
+  const finish=function(blob,mime){ if(settled)return;settled=true;cb(blob,mime); };
+  try{
+    const r=new FileReader();
+    r.onload=function(e){
+      try{
+        const img=new Image();
+        img.onload=function(){
+          const iw=img.width,ih=img.height;
+          if(!iw||!ih){finish(null,null);rawFallback('Image had no readable dimensions');return;}
+          // A photo taken straight from a phone camera can be huge (e.g. 4000x3000+),
+          // which can make canvas.toBlob() fail on memory-constrained mobile browsers,
+          // and even if it succeeds at a large maxDim the resulting file can still be
+          // too big to upload reliably over a weak mobile connection. So instead of a
+          // single attempt, try progressively SMALLER target sizes until one works —
+          // this is what actually fixes "logo uploads fine but signature (a big camera
+          // photo) doesn't": the logo file was already small, the signature wasn't.
+          const sizes=[maxDim, Math.round(maxDim*0.6), Math.round(maxDim*0.35), 300, 150];
+          let i=0;
+          const tryAt=function(dim){
+            let w=iw,h=ih;
+            if(w>dim||h>dim){
+              if(w>h){h=Math.round(h*dim/w);w=dim;}
+              else{w=Math.round(w*dim/h);h=dim;}
+            }
+            let canvas,ctx;
+            try{
+              canvas=document.createElement('canvas');
+              canvas.width=w;canvas.height=h;
+              ctx=canvas.getContext('2d');
+              ctx.drawImage(img,0,0,w,h);
+            }catch(err){ next(); return; }
+            if(!canvas.toBlob){
+              const du=canvas.toDataURL('image/jpeg',0.8);
+              fetch(du).then(function(rr){return rr.blob();}).then(function(b){ if(b&&b.size>0)finish(b,'image/jpeg'); else next(); }).catch(next);
+              return;
+            }
+            canvas.toBlob(function(blob){
+              if(blob&&blob.size>0){finish(blob,'image/webp');return;}
+              canvas.toBlob(function(b2){
+                if(b2&&b2.size>0)finish(b2,'image/jpeg');
+                else next();
+              },'image/jpeg',0.8);
+            },'image/webp',0.8);
+          };
+          const next=function(){
+            i++;
+            if(i<sizes.length)tryAt(sizes[i]);
+            else rawFallback('Image resize attempts all failed at every size');
+          };
+          tryAt(sizes[0]);
+        };
+        img.onerror=function(){rawFallback('Browser could not decode the image (unsupported format?)');};
+        img.src=e.target.result;
+      }catch(err){rawFallback('Image decode setup error: '+err.message);}
+    };
+    r.onerror=function(){rawFallback('Could not read the file from disk');};
+    r.readAsDataURL(file);
+  }catch(err){rawFallback('FileReader setup error: '+err.message);}
 }
 // Deterministic per-clinic, per-kind path so re-uploads simply overwrite the previous cloud
 // file (no orphaned Storage objects piling up, no separate cleanup job needed).
@@ -7951,7 +7988,9 @@ function fbStorageUpload(path,blob,mime,onProgress,cb){
         }catch(e){cb(e);}
       }else{ cb(new Error('Upload failed: HTTP '+xhr.status)); }
     };
+    xhr.timeout=30000;
     xhr.onerror=function(){cb(new Error('Network error during upload'));};
+    xhr.ontimeout=function(){cb(new Error('Upload timed out (slow connection) — will retry'));};
     xhr.send(blob);
   }catch(e){cb(e);}
 }
@@ -8013,32 +8052,26 @@ function hcUploadImageToCloud(kind,blob,mime,showToast,cb){
   });
 }
 // One unified handler for the three upload buttons: shows an instant local preview, then
-// uploads to Firebase Storage in the background (or queues for later if offline/not signed in).
+// syncs it straight to Firebase Realtime Database as part of Settings (base64, ~100KB cap
+// from hcCompressImage above). No Firebase Storage / CORS / bucket setup needed — this
+// reuses the exact same Database sync path that already works for Bills/Stock/Expenses.
 function hcHandleImageUpload(kind,file,maxDim,onDone){
   hcCompressImage(file,maxDim,function(localDataUrl){
     if(!localDataUrl){showClearToast('⚠ Could not read image.');onDone&&onDone(null);return;}
-    // Instant local preview + offline-safe fallback (capped ~100KB, same as before).
     hcSafeSetItem(HC_IMG_KEY_MAP[kind],localDataUrl);
     onDone&&onDone(localDataUrl);
-    if(!hcCloudReady()){
-      hcAddPendingUpload(kind);
-      showClearToast(HC_IMG_LABEL[kind]+' saved locally — will upload once you\'re signed in & online');
+    if(!hcUser2CloudReady()){
+      showClearToast(HC_IMG_LABEL[kind]+' saved locally — sign in to cloud sync to share it across devices');
       return;
     }
-    hcMakeWebpBlob(file,maxDim,function(blob,mime){
-      if(!blob){hcAddPendingUpload(kind);return;}
-      hcUploadImageToCloud(kind,blob,mime,true,function(err,url){
-        if(err){
-          hcAddPendingUpload(kind);
-          showClearToast('⚠ Cloud upload failed — kept locally, will retry automatically');
-          return;
-        }
-        const pv=document.getElementById(HC_IMG_PREVIEW_ID[kind]);
-        if(pv)pv.src=url;
-        if(typeof fbSyncSettingsNow==='function')fbSyncSettingsNow();
-      });
-    });
+    showClearToast(HC_IMG_LABEL[kind]+' saved!');
+    if(typeof fbSyncSettingsNow==='function')fbSyncSettingsNow();
   });
+}
+// Database-only cloud readiness check (signed in + a Database URL configured) — deliberately
+// does NOT require storageBucket, since images are no longer pushed to Firebase Storage.
+function hcUser2CloudReady(){
+  return !!(fbUser && fbIdToken && fbCfg && fbCfg.databaseURL);
 }
 // Retries any image still sitting locally (as a data: URL) once we're online + authenticated,
 // so nothing typed while offline is ever lost — it just finishes syncing later, silently.
@@ -8056,9 +8089,11 @@ function hcRetryPendingImageUploads(){
           const pv=document.getElementById(HC_IMG_PREVIEW_ID[kind]);
           if(pv)pv.src=url;
           if(typeof fbSyncSettingsNow==='function')fbSyncSettingsNow();
+        }else{
+          fbLog(HC_IMG_LABEL[kind]+' retry upload failed: '+(err&&err.message?err.message:err),'err');
         }
       });
-    }).catch(function(){});
+    }).catch(function(e){fbLog(HC_IMG_LABEL[kind]+' retry failed reading local image: '+e.message,'err');});
   });
 }
 window.addEventListener('online',hcRetryPendingImageUploads);
